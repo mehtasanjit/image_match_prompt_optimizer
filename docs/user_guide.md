@@ -246,6 +246,32 @@ This runs 3 × 3 = 9 grid cells, each with full GEPA optimization + evaluation.
     --output_file ./grid_runs/match/smartwatch_split/stepwise_blend.json
 ```
 
+### Stepwise GEPA with Error-Focused Sampling
+
+Instead of random sub-sampling, this mode runs the current prompt on all training data between steps, classifies predictions as TP/FP/FN/TN, and enriches the next step's sample with error cases (hard example mining). Step 0 uses random sampling; steps 1+ focus on current failures.
+
+```bash
+./venv/bin/python scripts/mlflow_gepa/run_gepa_binary_match_grid.py \
+    --project my-gcp-project \
+    --location global \
+    --target_model gemini-3-flash-preview \
+    --eval_cf_names img_match_weighted_guarded \
+    --eval_score_key match_score \
+    --num_iterations 16 \
+    --step_size 4 \
+    --error_focused \
+    --fp_fraction 1.0 --fn_fraction 1.0 \
+    --tp_fraction 0.3 --tn_fraction 0.3 \
+    --category smartwatch_split \
+    --data_dir ./data/sampled/label/smartwatch_split/train \
+    --eval_data_dir ./data/sampled/label/smartwatch_split/validation \
+    --initial_prompt ./prompts/binary_match_or_not.txt \
+    --eval_workers 10 \
+    --output_file ./grid_runs/match/smartwatch_split/error_focused.json
+```
+
+**Note**: `--error_focused` is incompatible with `--no_chaining`. Error-focused mode requires chaining because each step's error distribution depends on the previous step's prompt.
+
 ---
 
 ## Step 7: Analyze Results
@@ -460,6 +486,11 @@ See [pipeline.md](pipeline.md) for the full multi-step pipeline documentation.
 | `--subsample_fraction` | Fraction of training data for GEPA (0.0-1.0) | `1.0` |
 | `--step_size` | Stepwise GEPA iterations per step (0 = standard) | `0` |
 | `--no_chaining` | Blend mode: all steps independent, then blend | (flag) |
+| `--error_focused` | Error-aware sampling between steps (hard example mining). Incompatible with `--no_chaining` | (flag) |
+| `--fp_fraction` | Fraction of false positives to include per step (error-focused mode) | `1.0` |
+| `--fn_fraction` | Fraction of false negatives to include per step (error-focused mode) | `1.0` |
+| `--tp_fraction` | Fraction of true positives to include per step (error-focused mode) | `0.3` |
+| `--tn_fraction` | Fraction of true negatives to include per step (error-focused mode) | `0.3` |
 | `--eval_workers` | Concurrent workers for eval pipeline | `10` |
 | `--num_iterations` | Comma-separated iteration counts for grid | (required) |
 | `--eval_cf_names` | Comma-separated Cloud Function names for grid | (required) |

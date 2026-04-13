@@ -69,6 +69,44 @@ The blend step uses a template from `prompts/blend_prompts_template.txt` (match)
 - Prioritize precision-focused guardrails
 - Never invent new content beyond what exists in the source prompts
 
+#### 2c. Error-Focused Chaining (`--error_focused`)
+
+A variant of chaining that uses **hard example mining between steps**. Instead of random sub-sampling, it runs the current prompt on all training data after each step, classifies predictions as TP/FP/FN/TN, and enriches the next step's training sample with error cases.
+
+**Flow per step:**
+1. **Step 0**: Random sub-sample (no prior predictions exist)
+2. **Steps 1+**: Run predict_fn on full training data → classify each item as TP/FP/FN/TN → subsample with configurable quadrant fractions
+
+Default fractions: 100% of FP, 100% of FN, 30% of TP, 30% of TN — focusing GEPA on the current failure modes.
+
+```bash
+./venv/bin/python scripts/mlflow_gepa/run_gepa_binary_match_grid.py \
+    --project my-gcp-project \
+    --eval_cf_names img_match_weighted_guarded \
+    --eval_score_key match_score \
+    --num_iterations 16 \
+    --step_size 4 \
+    --error_focused \
+    --fp_fraction 1.0 --fn_fraction 1.0 \
+    --tp_fraction 0.3 --tn_fraction 0.3 \
+    --category smartwatch \
+    --data_dir data/images/smartwatch/train \
+    --eval_data_dir data/images/smartwatch/eval \
+    --initial_prompt prompts/binary_match_or_not.txt \
+    --output_file grid_runs/match/smartwatch/error_focused.json
+```
+
+**Key differences from standard stepwise:**
+
+| | Standard stepwise | Error-focused |
+|---|---|---|
+| Between-step sampling | Random (different seed per step) | TP/FP/FN/TN-aware |
+| What changes per step | Random seed → different subset | Error distribution → different failures |
+| Cost | Low (no inter-step eval) | Higher (full predict pass between steps) |
+| Signal quality | Random diversity | Targeted error focus |
+
+**Incompatibility**: `--error_focused` requires chaining (`--no_chaining` is not allowed). Error-focused mode depends on the prompt changing between steps — with no-chaining, all steps use the same initial prompt, producing identical error distributions.
+
 ### 3. Grid Search (`run_gepa_binary_match_grid.py` / `run_gepa_binary_mismatch_grid.py`)
 
 Runs GEPA across a Cartesian product of Cloud Function names × iteration counts, then evaluates each optimized prompt on held-out train/validation/test splits using the full pipeline.
