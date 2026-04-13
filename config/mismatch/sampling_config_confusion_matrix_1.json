@@ -1,0 +1,23 @@
+{
+  "train":{
+    "output_results_filepath": "",
+    "fraction_tp": 0.32,
+    "fraction_fp": 0.38,
+    "fraction_fn": 0.38,
+    "fraction_tn": 0.32
+  },
+  "validation":{
+    "output_results_filepath": "",
+    "fraction_tp": 0.33,
+    "fraction_fp": 0.32,
+    "fraction_fn": 0.32,
+    "fraction_tn": 0.33
+  },
+  "test":{
+    "output_results_filepath": "",
+    "fraction_tp": 0.35,
+    "fraction_fp": 0.3,
+    "fraction_fn": 0.3,
+    "fraction_tn": 0.35
+  }
+}

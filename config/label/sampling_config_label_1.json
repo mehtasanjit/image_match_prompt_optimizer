@@ -1,0 +1,17 @@
+{
+  "train": {
+    "fraction_match": 0.8,
+    "fraction_mismatch": 0.8,
+    "fraction_inconclusive": 0.8
+  },
+  "validation": {
+    "fraction_match": 0.1,
+    "fraction_mismatch": 0.1,
+    "fraction_inconclusive": 0.1
+  },
+  "test": {
+    "fraction_match": 0.1,
+    "fraction_mismatch": 0.1,
+    "fraction_inconclusive": 0.1
+  }
+}

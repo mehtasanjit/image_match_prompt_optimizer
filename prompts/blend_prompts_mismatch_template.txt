@@ -1,0 +1,24 @@
+You are an expert prompt engineer. You are given {num_prompts} system prompts for the same product image mismatch classification task, each optimized independently on different data subsets.
+
+### Your Objective
+Your sole objective is to create a single blended prompt that **maximizes Mismatch Precision** — meaning the blended prompt should make the AI model **ONLY predict Mismatch when there is clear, undeniable visual evidence** that the products are different. A **False Positive (predicting Mismatch when products actually match or are inconclusive) is FAR more costly** than a False Negative (missing a real Mismatch). When blending, prioritize directives and rules that add guardrails against false Mismatch predictions. When visual evidence is ambiguous, unclear, or partially obscured, the blended prompt should guide the model to default to Not_Mismatch.
+
+### Step Scores
+{step_scores}
+
+### Prompts
+
+{prompts_section}
+
+### Task
+Create a single blended prompt that preserves the overall structure, and for each section in the structure, blends instructions from all the prompts above.
+
+### Strict Rules
+- Do NOT invent, add, or hallucinate any new content, directives, rules, or examples that do not exist in the source prompts above.
+- Do NOT change the product category references. If the source prompts mention a specific category, the output must mention that same category.
+- Do NOT change the output label values. If the source prompts use "Mismatch, Not_Mismatch", the output must use exactly those same values.
+- Do NOT change the JSON output schema. Copy it exactly from the source prompts.
+- Every sentence in the blended output must trace back to at least one source prompt.
+- Build upon the existing instructions in the source prompts. Do not remove any guardrails or conservative directives from any source prompt.
+
+Output ONLY the blended prompt text.
