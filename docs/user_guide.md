@@ -498,6 +498,8 @@ See [pipeline.md](pipeline.md) for the full multi-step pipeline documentation.
 | `--full_data_dir` | Full dataset directory for final evaluation | (optional) |
 | `--num_iterations` | Comma-separated iteration counts for grid | (required) |
 | `--eval_cf_names` | Comma-separated Cloud Function names for grid | (required) |
+| `--num_repetitions` | Number of repetitions per grid cell (each uses a derived seed) | `1` |
+| `--num_repetition_workers` | Max concurrent grid cells to run in parallel | `1` |
 | `--reflection_prompt_template` | Custom reflection prompt for the critic model (see below) | (optional) |
 
 ---
@@ -530,6 +532,155 @@ Usage:
 ```
 
 If not provided, GEPA uses its default built-in reflection prompt.
+
+---
+
+## Recommended Configurations & Practical Lessons
+
+The following recommendations are derived from extensive experimentation across multiple product categories. They are starting points — results vary by category and data distribution.
+
+### Cost Function Selection
+
+Not all cost function variants perform equally. In practice, three have consistently produced useful results:
+
+| CF Variant | When to Use |
+|------------|-------------|
+| **Guarded** | Default starting point. Balances precision and recall well, avoids over-aggressive label flipping. Works across most categories. |
+| **Highly Aggressive** | When you need to push precision higher and are willing to sacrifice some recall. Useful for categories where false positives are costly. |
+| **Moderate** | A middle ground. Good when guarded is too conservative but highly aggressive is too punitive. |
+
+CFs like `balanced` and `aggressive` can work in some categories but tend to produce less stable results. `ultra_aggressive` variants often push too hard and cause degenerate prompts. Start with `guarded` and expand from there.
+
+### Iteration Counts
+
+- **12–16 iterations** is the sweet spot for most runs. This gives GEPA enough cycles to explore and refine without overfitting.
+- **18 iterations** can help in specific cases (complex categories, large training sets), but beyond 18 the returns diminish rapidly.
+- Below 10, GEPA often hasn't converged. Above 20, you risk overfitting to the training sample.
+
+For stepwise mode, the total iterations = `num_iterations` and each step runs `step_size` iterations. A common configuration is `--num_iterations 16 --step_size 4` (4 steps of 4 iterations each).
+
+### Data Splits & Sample Sizes
+
+Given typical dataset sizes (50–200 items per category), the recommended split strategy:
+
+| Split | Fraction | Purpose |
+|-------|----------|---------|
+| **Train** | ~80% | GEPA optimization input |
+| **Validation** | ~20% | Post-optimization eval, prompt selection |
+| **Test** | (optional) | Held-out generalization check |
+
+With only 20% for validation, a single run may overfit to a particular subsample. The mitigation strategy is to **run multiple optimization rounds** with the same CF and iteration count but **different sub-sample fractions and random seeds**, then either:
+
+1. **Select the best** — pick the run with highest validation precision (or best precision-recall tradeoff)
+2. **Blend** — combine prompts from multiple runs using the blend script (Step 9), which merges the strongest instructions from each
+
+### Ensemble Strategy: Repetitions (Built-In)
+
+The grid runners have built-in repetition support via `--num_repetitions`. Each repetition runs the same CF + iteration configuration but with a **different derived seed** (`base_seed + rep_idx × 17`), producing a different training subsample. All repetitions go into the same output file as flat entries:
+
+```bash
+# 3 repetitions of guarded_16, each with a different subsample
+./venv/bin/python scripts/mlflow_gepa/run_gepa_binary_match_grid.py \
+    --eval_cf_names img_match_weighted_guarded \
+    --eval_score_key match_score \
+    --num_iterations 16 \
+    --subsample_fraction 0.5 \
+    --num_repetitions 3 \
+    --category smartwatch_split \
+    --data_dir ./data/sampled/label/smartwatch_split/train \
+    --eval_data_dir ./data/sampled/label/smartwatch_split/validation \
+    --initial_prompt ./prompts/binary_match_or_not.txt \
+    --output_file ./grid_runs/match/smartwatch/guarded_16_x3.json \
+    ...
+```
+
+This produces 3 entries in `results[]`, each with `"repetition": 0/1/2` and `"seed": 42/59/76`. The analysis and extraction scripts work as-is:
+- **`analyze_grid_precision_recall_tradeoff.py`** treats each rep as an independent cell — ranks them all, shows them in the ALL CELLS table
+- **`extract_prompt_from_grid_run.py`** finds all matching reps and creates numbered output files (`_1.txt`, `_2.txt`, etc.)
+
+For concurrent execution (multiple cells running in parallel), use `--num_repetition_workers`:
+
+```bash
+# Run 3 reps with 2 concurrent workers
+--num_repetitions 3 --num_repetition_workers 2
+```
+
+**Caution**: Each concurrent worker makes its own API calls. With `num_repetition_workers=2` and `eval_workers=10`, you may have up to 20 concurrent model calls during eval phases. Keep API quotas in mind.
+
+### Ensemble Strategy: Multiple Separate Runs (Alternative)
+
+If you prefer separate output files per seed (e.g. for different subsample fractions), you can still run them manually:
+
+```bash
+# Run 1: 50% subsample, seed 42
+./venv/bin/python scripts/mlflow_gepa/run_gepa_binary_match_grid.py \
+    --eval_cf_names img_match_weighted_guarded \
+    --eval_score_key match_score \
+    --num_iterations 16 \
+    --subsample_fraction 0.5 --random_seed 42 \
+    --output_file ./grid_runs/match/smartwatch/run_seed42.json \
+    ...
+
+# Run 2: 70% subsample, seed 99
+./venv/bin/python scripts/mlflow_gepa/run_gepa_binary_match_grid.py \
+    --eval_cf_names img_match_weighted_guarded \
+    --eval_score_key match_score \
+    --num_iterations 16 \
+    --subsample_fraction 0.7 --random_seed 99 \
+    --output_file ./grid_runs/match/smartwatch/run_seed99.json \
+    ...
+```
+
+Then analyze all runs together and either pick the best or blend:
+
+```bash
+# Compare all runs (scans all *.json in folder)
+./venv/bin/python scripts/post_optimization/analyze_grid_precision_recall_tradeoff.py \
+    --input_dir ./grid_runs/match/smartwatch --verbose
+
+# Or blend the best prompts
+./venv/bin/python scripts/post_optimization/blend_prompts.py \
+    --input_files \
+        ./grid_runs/match/smartwatch/run_seed42.json \
+        ./grid_runs/match/smartwatch/run_seed99.json \
+    --output_prompt ./prompts/smartwatch_match_blended.txt \
+    --project my-gcp-project
+```
+
+### Prevalence & Distribution
+
+**Critical lesson**: GEPA optimizes within whatever data distribution you give it. If your training split has a very different label distribution from production data, the optimized prompt may not generalize.
+
+- If your category has 9% match rate in production but your training set is artificially balanced to 33% match, the prompt will be optimized for a world where matches are common — and will likely over-predict Match on real data.
+- Prefer training splits that **reflect the natural distribution** of your category, or at least are not drastically different.
+- When in doubt, evaluate the final prompt on the full dataset (`--full_data_dir`) to catch distribution mismatch early.
+
+### Quick-Start Configuration
+
+For a first run on a new category, this configuration works well as a baseline:
+
+```bash
+./venv/bin/python scripts/mlflow_gepa/run_gepa_binary_match_grid.py \
+    --project my-gcp-project \
+    --location global \
+    --target_model gemini-3-flash-preview \
+    --temperature 1.0 --top_p 0.42 \
+    --critic_model gemini-3.1-pro-preview \
+    --critic_model_location global \
+    --critic_reasoning_effort high \
+    --eval_cf_names img_match_weighted_guarded \
+    --eval_score_key match_score \
+    --num_iterations 16 \
+    --subsample_fraction 0.5 \
+    --category <your_category> \
+    --data_dir ./data/sampled/label/<your_category>/train \
+    --eval_data_dir ./data/sampled/label/<your_category>/validation \
+    --initial_prompt ./prompts/binary_match_or_not.txt \
+    --eval_workers 10 \
+    --output_file ./grid_runs/match/<your_category>/baseline.json
+```
+
+Then iterate: try `highly_aggressive` and `moderate` CFs, vary the seed, and compare results with the tradeoff analysis script.
 
 ---
 

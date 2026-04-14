@@ -28,6 +28,7 @@ import logging
 import os
 import sys
 import time
+import threading
 import concurrent.futures
 
 # Ensure mlflow_gepa is importable as a top-level package
@@ -251,6 +252,14 @@ def main():
     parser.add_argument("--full_data_mapping_csv", default="",
                         help="Explicit path to full dataset mapping CSV (optional).")
 
+    # Repetitions
+    parser.add_argument("--num_repetitions", type=int, default=1,
+                        help="Number of repetitions per grid cell. Each repetition uses a different "
+                             "derived seed for sub-sampling. Default 1 (no repetitions).")
+    parser.add_argument("--num_repetition_workers", type=int, default=1,
+                        help="Max concurrent grid cells to run in parallel. Default 1 (sequential). "
+                             "Values > 1 run cells concurrently using threads. Be mindful of API quotas.")
+
     # Debug
     parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging")
 
@@ -291,17 +300,26 @@ def main():
             f"({len(cf_names)}). Got {len(score_keys_raw)}."
         )
 
-    # Build grid
+    # Build grid (with repetitions)
+    num_reps = max(1, args.num_repetitions)
     grid = []
     for idx, cf_name in enumerate(cf_names):
         for num_iter in iterations_list:
-            grid.append({
-                "eval_cf_name": cf_name,
-                "eval_score_key": score_keys[idx],
-                "num_iterations": num_iter,
-            })
+            for rep_idx in range(num_reps):
+                rep_seed = args.random_seed + rep_idx * 17
+                grid.append({
+                    "eval_cf_name": cf_name,
+                    "eval_score_key": score_keys[idx],
+                    "num_iterations": num_iter,
+                    "repetition": rep_idx,
+                    "seed": rep_seed,
+                })
 
-    logger.info("Grid has %d cells: %d CF(s) × %d iteration count(s)", len(grid), len(cf_names), len(iterations_list))
+    if num_reps > 1:
+        logger.info("Grid has %d cells: %d CF(s) × %d iteration count(s) × %d repetition(s)",
+                     len(grid), len(cf_names), len(iterations_list), num_reps)
+    else:
+        logger.info("Grid has %d cells: %d CF(s) × %d iteration count(s)", len(grid), len(cf_names), len(iterations_list))
 
     # Pre-load all splits once
     train_data = _load_eval_data(args.data_dir, train_category, 0, args.mapping_csv)
@@ -340,19 +358,29 @@ def main():
         os.makedirs(output_dir, exist_ok=True)
 
     all_results = []
+    results_lock = threading.Lock()
 
-    for cell_idx, cell in enumerate(grid):
+    def _run_single_cell(cell_idx, cell):
+        """Process a single grid cell. Returns the cell result dict."""
         cf_name = cell["eval_cf_name"]
         score_key = cell["eval_score_key"]
         num_iter = cell["num_iterations"]
+        rep_idx = cell.get("repetition", 0)
+        cell_seed = cell.get("seed", args.random_seed)
 
-        cell_label = f"[{cell_idx + 1}/{len(grid)}] cf={cf_name} iters={num_iter}"
+        if num_reps > 1:
+            cell_label = f"[{cell_idx + 1}/{len(grid)}] cf={cf_name} iters={num_iter} rep={rep_idx} seed={cell_seed}"
+        else:
+            cell_label = f"[{cell_idx + 1}/{len(grid)}] cf={cf_name} iters={num_iter}"
         logger.info("=" * 70)
         logger.info("GRID CELL %s", cell_label)
         logger.info("=" * 70)
 
         # Use a unique prompt name per cell to avoid MLflow registry collisions
-        cell_prompt_name = f"{args.prompt_name}_{cf_name}_{num_iter}"
+        if num_reps > 1:
+            cell_prompt_name = f"{args.prompt_name}_{cf_name}_{num_iter}_rep{rep_idx}"
+        else:
+            cell_prompt_name = f"{args.prompt_name}_{cf_name}_{num_iter}"
 
         gepa_config = GEPAConfig(
             project=args.project,
@@ -373,7 +401,7 @@ def main():
             data_dir=args.data_dir,
             mapping_csv=args.mapping_csv,
             max_train_samples=effective_max_train,
-            random_seed=args.random_seed,
+            random_seed=cell_seed,
             num_iterations=num_iter,
             experiment_name=args.experiment_name,
             reflection_prompt_template_path=args.reflection_prompt_template or "",
@@ -404,11 +432,7 @@ def main():
             final_eval_score = getattr(result, "final_eval_score", None)
         except Exception as e:
             logger.error("GEPA run failed for %s: %s", cell_label, e)
-            all_results.append({
-                "grid_cell": cell,
-                "error": str(e),
-            })
-            continue
+            return {"grid_cell": cell, "error": str(e)}
         gepa_duration = time.time() - gepa_start
 
         logger.info("GEPA done in %.1fs | initial=%.4f final=%.4f",
@@ -543,10 +567,30 @@ def main():
         if full_summary is not None:
             cell_result["eval_full"] = full_summary
             cell_result["eval_full_duration_sec"] = round(full_eval_duration, 1)
-        all_results.append(cell_result)
+        return cell_result
 
-        # Write intermediate results after each cell
-        _write_output(args.output_file, all_results, grid)
+    # ── Execute grid cells (sequential or concurrent) ──
+    num_cell_workers = max(1, args.num_repetition_workers)
+
+    if num_cell_workers <= 1:
+        # Sequential execution (default, same as original behavior)
+        for cell_idx, cell in enumerate(grid):
+            cell_result = _run_single_cell(cell_idx, cell)
+            all_results.append(cell_result)
+            _write_output(args.output_file, all_results, grid)
+    else:
+        # Concurrent execution across grid cells
+        logger.info("Running grid cells with %d concurrent workers", num_cell_workers)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_cell_workers) as executor:
+            future_to_idx = {
+                executor.submit(_run_single_cell, idx, cell): idx
+                for idx, cell in enumerate(grid)
+            }
+            for future in concurrent.futures.as_completed(future_to_idx):
+                cell_result = future.result()
+                with results_lock:
+                    all_results.append(cell_result)
+                    _write_output(args.output_file, all_results, grid)
 
     # Final write
     _write_output(args.output_file, all_results, grid)
