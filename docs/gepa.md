@@ -2,17 +2,356 @@
 
 ## Overview
 
-GEPA (Genetic-Pareto) is MLflow's automated prompt optimization algorithm. It uses iterative mutation, reflection, and Pareto-aware candidate selection to improve prompts. A reflection model (LLM) analyzes system behavior on failures and proposes improvements, while Pareto selection ensures optimization across multiple objectives simultaneously.
+GEPA (Genetic-Pareto) is an open-source prompt optimization library that MLflow wraps via its `GepaPromptOptimizer` class. GEPA uses iterative mutation, reflection, and Pareto-aware candidate selection to improve prompts. A reflection model (LLM) analyzes system behavior on failures and proposes improvements, while Pareto selection ensures optimization across multiple objectives simultaneously.
 
 This project uses GEPA to iteratively refine system prompts for product image comparison, maximizing precision on a custom weighted cost function deployed as a GCP Cloud Function.
 
-The optimization loop works as follows:
+The optimization loop works at two levels:
 
-1. **Predict**: The target model (e.g. `gemini-2.5-flash`) processes each training example using the current prompt — comparing a reference image against a candidate image and outputting a JSON classification.
-2. **Score**: Each prediction is evaluated by a Cloud Function scorer that computes a weighted score (e.g. `match_score` or `mismatch_score`).
-3. **Reflect**: A critic/reflection model (e.g. `gemini-3.1-pro-preview`) analyzes failures and proposes prompt mutations.
-4. **Select**: Pareto-aware candidate selection picks the best prompt variant.
-5. **Update**: The improved prompt is registered and the cycle repeats.
+**Outer loop (our framework)**: Controlled by `run_gepa.py` / `run_gepa_stepwise.py`. Loads data, initializes MLflow, sets up the scorer, and calls `mlflow.genai.optimize_prompts()`. For stepwise mode, runs multiple GEPA optimizations sequentially with different data compositions.
+
+**Inner loop (GEPA library)**: Controlled entirely by the `gepa` package. Runs hundreds of proposal-evaluate-reflect cycles within a single `gepa.optimize()` call. Each cycle:
+
+1. **Select** a candidate from the Pareto frontier (a pool of diverse prompts, each best at something)
+2. **Predict** on a minibatch of 3 training examples using the target model (e.g. `gemini-3-flash-preview`), capturing full execution traces (model reasoning, scores)
+3. **Reflect** using the critic model (e.g. `gemini-3.1-pro-preview` with thinking_level=HIGH) — it reads the 3 traces, diagnoses *specific* failure patterns, and proposes a new prompt with targeted modifications
+4. **Validate** the proposed prompt on the same 3 items — if it improves, run full validation on ALL training items
+5. **Score** each prediction via the Cloud Function scorer, which applies the weighted cost function (e.g. TP=+1, FP=-9, FN=-2, TN=+0.5)
+6. **Update** the Pareto frontier if the new prompt is not dominated by existing candidates
+7. **Repeat** until the metric call budget (`num_iterations × dataset_size`) is exhausted
+
+At the end, GEPA returns the candidate with the highest average score across all training items. See the "GEPA Algorithm (Deep Dive)" section below for the full algorithm with annotated logs.
+
+## The GEPA Algorithm (Deep Dive)
+
+GEPA is a **separate library** (`gepa` pip package) that MLflow wraps via `GepaPromptOptimizer`. MLflow provides the orchestration (prompt registry, scoring, data loading); GEPA provides the actual optimization algorithm.
+
+**Paper**: [GEPA: Genetic-Pareto Optimization for Text Evolution](https://arxiv.org/abs/2507.19457)
+
+### Core Concepts
+
+| Concept | Description |
+|---|---|
+| **Candidate** | A dictionary mapping component names to text values. E.g., `{"system_prompt": "You are..."}`. In our case, a single prompt being optimized. |
+| **Pareto Frontier** | A set of candidates where each is the best at *something* — e.g., excelling on different subsets of examples. Any candidate that is not dominated (beaten on all objectives) survives. |
+| **Metric Call** | One predict+score evaluation on a single training example. The fundamental unit of compute budget. |
+| **Reflection LM** | The critic model (e.g., `gemini-3.1-pro-preview`) that analyzes execution traces and proposes prompt improvements. |
+| **Actionable Side Information (ASI)** | Execution traces, error messages, reasoning logs captured during evaluation — the raw material the reflection LM uses to diagnose failures. |
+
+### The Optimization Loop
+
+Each GEPA iteration chooses between two strategies:
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                     GEPA Iteration                                │
+│                                                                   │
+│  ┌─────────────────────┐     ┌──────────────────────────┐        │
+│  │ Strategy A:          │     │ Strategy B:               │        │
+│  │ REFLECTIVE MUTATION  │ OR  │ SYSTEM-AWARE MERGE        │        │
+│  └──────────┬──────────┘     └────────────┬─────────────┘        │
+│             │                              │                      │
+│             ▼                              ▼                      │
+│  1. Select candidate        1. Select two candidates              │
+│     from Pareto frontier       from Pareto frontier               │
+│             │                              │                      │
+│  2. Evaluate on MINIBATCH   2. Merge modules based on             │
+│     (3 examples, with          evolution history                  │
+│      full trace capture)                   │                      │
+│             │                              │                      │
+│  3. REFLECT: Reflection LM  3. Evaluate merged candidate         │
+│     analyzes traces,            on stratified subsample           │
+│     diagnoses failures                     │                      │
+│             │                              │                      │
+│  4. PROPOSE: Generate        4. If score ≥ parents' scores        │
+│     improved candidate          → proceed to full eval            │
+│             │                              │                      │
+│  5. Evaluate proposal on                   │                      │
+│     SAME minibatch                         │                      │
+│             │                              │                      │
+│  6. If improved on minibatch               │                      │
+│     → proceed to full eval                 │                      │
+│             │                              │                      │
+│             └──────────────┬───────────────┘                      │
+│                            ▼                                      │
+│              ┌──────────────────────┐                             │
+│              │  FULL VALIDATION      │                             │
+│              │  (entire val set)     │                             │
+│              │  Update Pareto        │                             │
+│              │  frontier if better   │                             │
+│              └──────────────────────┘                             │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Detailed Step-by-Step (Reflective Mutation Path)
+
+1. **Candidate Selection**: Pick a candidate from the Pareto frontier using novelty-weighted sampling (balances exploration vs exploitation)
+
+2. **Minibatch Evaluation**: Run the candidate on a small batch of training examples (`reflection_minibatch_size`, default=3). Crucially, this captures **full execution traces** — the model's reasoning, intermediate outputs, and scores — not just the final label.
+
+3. **Reflection**: The `reflection_lm` receives the traces and diagnoses *why* the candidate failed on specific examples. It sees:
+   - The current prompt text
+   - The model's full output (including reasoning)
+   - The ground truth
+   - The score
+   
+   It then proposes **targeted textual modifications** — not random mutations, but directed changes based on observed failure patterns.
+
+4. **Proposal Evaluation**: The proposed new candidate is evaluated on the **same minibatch**. This is a cheap sanity check — if the proposal doesn't improve on 3 examples, it's unlikely to improve on the full dataset.
+
+5. **Acceptance Gate**: If the proposal improves the minibatch score, it proceeds to full validation. If not, it's rejected and the iteration ends (metric calls were still consumed).
+
+6. **Full Validation**: The accepted candidate is evaluated on the entire validation set. The Pareto frontier is updated — the new candidate is added if it's not dominated by any existing candidate.
+
+### System-Aware Merge (Strategy B)
+
+Periodically, GEPA picks two candidates from the Pareto frontier and merges them:
+
+- If candidate A was refined on algebraic problems and candidate B excels at geometry, the merge creates a hybrid combining the strengths of both
+- Module selection is based on **evolution history** — if a component was actively refined in one candidate but left unchanged in another, the refined version is preferred
+- The merged candidate must score ≥ both parents to be accepted
+
+### From Many Candidates to One Output
+
+Throughout optimization, GEPA maintains a **Pareto frontier** — multiple candidates that each excel on different subsets of training examples. But at the end, it must return a **single best prompt**.
+
+**During optimization** — the Pareto frontier drives exploration:
+- Candidates are selected from the frontier for mutation using novelty-weighted sampling
+- A candidate that's best on 3 specific hard cases survives even if its overall score is mediocre
+- Different `frontier_type` settings control how the frontier is tracked:
+  - `instance`: Per-example Pareto dominance (candidate A survives if it's the best on even one example)
+  - `objective`: Per-objective (relevant for multi-objective optimization)
+  - `hybrid`/`cartesian`: Combinations of the above
+
+**After optimization** — final selection is simple:
+- Every candidate that was ever added to the Pareto frontier has a `val_aggregate_score` — the average weighted score across ALL validation items
+- The final output is the candidate with the **highest `val_aggregate_score`**
+- This is a straightforward argmax, not Pareto selection
+
+So the Pareto frontier's role is to **maintain diversity during search** (preventing premature convergence to a local optimum), while the final selection is purely **"which candidate has the best average score across all data?"**
+
+In our case, the `val_aggregate_score` is the average Cloud Function score (guarded CF: TP=+1, FP=-9, FN=-2, TN=+0.5) across all training items. The candidate that maximizes this weighted average — balancing precision and recall as encoded by the CF weights — wins.
+
+**Source code reference** ([`src/gepa/core/result.py`](https://github.com/gepa-ai/gepa/blob/c861dcd8841b7748733a573655f65d9638de99b6/src/gepa/core/result.py)):
+
+```python
+# GEPAResult class in gepa library
+@property
+def best_idx(self):
+    # Returns index of candidate with highest average validation score
+    return max(range(len(self.val_aggregate_scores)),
+               key=lambda i: self.val_aggregate_scores[i])
+
+@property
+def best_candidate(self):
+    return self.candidates[self.best_idx]
+```
+
+In our code, MLflow exposes this via `result.final_eval_score` (maps to `val_aggregate_scores[best_idx]`) and `result.optimized_prompts[0].template` (maps to `best_candidate`).
+
+### How `max_metric_calls` Relates to `--num_iterations` and Dataset Size
+
+In our framework:
+
+```
+max_metric_calls = --num_iterations × len(training_data)
+```
+
+**Example**: `--num_iterations 16` with 96 training items:
+```
+max_metric_calls = 16 × 96 = 1,536
+```
+
+But GEPA does NOT do 16 sequential passes over 96 items. Instead, it spends 1,536 metric calls across:
+
+| Activity | Calls per occurrence | How many times |
+|---|---|---|
+| Minibatch evaluation | 3 (default) | Many (one per iteration) |
+| Minibatch validation of proposal | 3 | Many (one per accepted proposal) |
+| Full validation | N (all val items) | Few (only when proposal improves minibatch) |
+| Rejected proposals | 3-6 | Variable |
+
+So the actual number of GEPA iterations (proposal cycles) **far exceeds** `--num_iterations`. With `max_metric_calls=1536`:
+
+- If full validation runs on 96 items and happens ~5 times: 480 calls
+- Remaining 1056 calls ÷ 6 calls per iteration ≈ **176 proposal cycles**
+- Of those, maybe 20-30 are accepted → 20-30 actual prompt improvements
+
+**GEPA's recommendation**: Run with `max_metric_calls` at least 15-30× the validation set size. For 96 items, that's 1,440-2,880 — equivalent to `--num_iterations 15-30`.
+
+### Why This Matters for Our Framework
+
+| Parameter | What it controls | Effect |
+|---|---|---|
+| `--num_iterations` | Total metric call budget (×dataset) | More budget → more proposal cycles → better prompts, but more cost |
+| `--subsample_fraction` | Dataset size seen by GEPA | Smaller dataset → more iterations per budget → faster but potentially overfit |
+| `--step_size` | Budget per stepwise step | Each step gets `step_size × dataset` metric calls |
+| `--error_focused` | What data GEPA sees | Changes composition, not budget |
+
+The interplay between dataset size and iteration count matters:
+
+```
+# 320 items, 16 iterations = 5,120 metric calls = many proposal cycles
+--data_dir (320 items) --num_iterations 16
+
+# 96 items, 16 iterations = 1,536 metric calls = fewer proposal cycles  
+--data_dir (96 items) --num_iterations 16
+
+# 96 items, 48 iterations = 4,608 metric calls ≈ same as first case
+--data_dir (96 items) --num_iterations 48
+```
+
+For small datasets (<100 items), increase `--num_iterations` to compensate for the reduced metric call budget.
+
+### Mapping GEPA Concepts to Our Implementation
+
+| GEPA Internal Concept | Our Implementation | Where |
+|---|---|---|
+| **seed_candidate** | Initial prompt loaded from `--initial_prompt` file, registered in MLflow prompt registry | `run_gepa.py` line: `mlflow.register_prompt(template=initial_prompt_text)` |
+| **trainset** | DataFrame from `data_loader.load_eval_data()` — each row has `inputs` (image paths) and `outputs` (ground truth) | `data_loader.py` |
+| **valset** | Same as trainset (GEPA uses trainset for both minibatch eval and full validation in our setup) | MLflow passes `train_data` to GEPA as both train and val |
+| **adapter / predict_fn** | `predict.predict_fn(reference_image_path, image_path)` — calls Gemini Flash with current prompt, returns full JSON | `predict.py` |
+| **metric / scorer** | `scorer.weighted_scorer` — calls Cloud Function with `{response, target}`, returns weighted score | `scorer.py` |
+| **reflection_lm** | `vertex_ai:/gemini-3.1-pro-preview` with `reasoning_effort="high"` via `ThinkingGepaPromptOptimizer` | `thinking_optimizer.py` |
+| **max_metric_calls** | `num_iterations × len(train_data)` — computed by our grid runner, passed to `GepaPromptOptimizer` | `run_gepa.py`: `max_metric_calls = config.num_iterations * len(train_data)` |
+| **reflection_minibatch_size** | Default 3 (GEPA default, we don't override) — 3 image pairs evaluated per reflection cycle. See note below. | GEPA internal default |
+| **Pareto frontier** | Managed entirely by GEPA internally — we only see the final best candidate | GEPA internal |
+| **System-Aware Merge** | Happens automatically within GEPA — we have a single component (`system_prompt`), so merge is less impactful | GEPA internal |
+| **Full validation** | GEPA evaluates accepted proposals on the entire `train_data` DataFrame — this is where most metric calls go | GEPA internal |
+| **ASI / execution traces** | Our `predict_fn` returns the full model JSON (including `reason` field) — GEPA captures this as traces for the reflection LM | `predict.py` returns full JSON, not just the label |
+| **Callbacks** | Not used in our implementation — could add for logging/monitoring | Available via `gepa.optimize(callbacks=[...])` |
+
+**Note on `reflection_minibatch_size`**: We don't expose this parameter — it uses GEPA's default of **3**. Each GEPA iteration samples exactly **1 minibatch of 3 items** (not multiple minibatches). The cycle is: sample 3 → evaluate with traces → reflect → propose → validate on same 3 → accept/reject → (if accepted) full validation on all items. One minibatch per cycle.
+
+**How many minibatch cycles per `gepa.optimize()` call?** Hundreds. Each cycle consumes metric calls as follows:
+
+| Outcome | Metric calls consumed | Breakdown |
+|---|---|---|
+| **Rejected proposal** | **6** | 3 (evaluate current candidate on minibatch) + 3 (validate proposal on same minibatch). The proposal didn't improve the minibatch score → rejected, no full validation. |
+| **Accepted proposal** | **6 + N** | 3 (minibatch eval) + 3 (minibatch validation) + N (full validation on all items). The proposal improved the minibatch → accepted → full dataset evaluation. |
+
+Note: The reflection LLM call (critic model) between minibatch eval and proposal is NOT a metric call — it doesn't consume budget.
+
+With `max_metric_calls = 2,928` and 183 training items: ~240-340 minibatch cycles run, of which ~5-8 get accepted. See the "Under the Hood" section for a worked example with actual log output.
+
+**Is 3 enough?** For vision tasks with expensive per-item calls (2 images + prompt → Gemini Flash), 3 is a good tradeoff:
+- Gives the critic enough failure diversity per cycle (e.g., 1 FP + 1 FN + 1 TN)
+- Keeps per-iteration cost low (6 metric calls for a rejected proposal, ~N+6 for accepted)
+- More iterations with diverse minibatches > fewer iterations with larger batches
+- GEPA docs recommend 3-5 for sample efficiency
+
+GEPA supports overriding this via `EngineConfig(reflection_minibatch_size=N)`, but we don't currently expose it as a CLI arg. If you want to experiment with larger minibatches (e.g., 5-10 for categories with many similar failure modes), the GEPA config can be extended.
+
+**Key insight**: We only control the outer loop (what data GEPA sees, how many metric calls, which scorer). GEPA controls the inner loop (minibatch selection, reflection strategy, Pareto management, acceptance decisions). Our stepwise/error-focused modes add a layer *above* GEPA — they run multiple GEPA optimizations sequentially with different data compositions.
+
+### Under the Hood: What Happens in One Step (Annotated Log)
+
+This traces through one complete error-focused step to show exactly what happens at each layer.
+
+**Phase 1 — Our code (error-focused sampling):**
+
+The stepwise runner runs the current prompt on all 319 training items, classifies each prediction:
+
+```
+Classification distribution: TP=86 FP=20 FN=97 TN=116
+  TP: 43/86 (50%)      ← Keep half the correct matches (anchoring examples)
+  FP: 20/20 (100%)     ← Keep ALL false positives (most valuable for precision)
+  FN: 97/97 (100%)     ← Keep ALL false negatives (missed matches)
+  TN: 23/116 (20%)     ← Keep 20% of correct rejections (background)
+Error-aware subsample: 183 items
+Step 2: max_metric_calls=2928 (16 iters × 183 samples)
+```
+
+183 items are passed to GEPA. The metric call budget is `16 × 183 = 2,928`.
+
+**Phase 2 — MLflow wrapper:**
+
+```
+Testing model prediction with the first sample  ← MLflow sanity-checks predict_fn works
+ThinkingGepaPromptOptimizer: reasoning_effort=high
+Patched gepa.optimize: reflection_lm replaced   ← Our patch swaps string URI for thinking LM
+```
+
+MLflow sets up the GEPA adapter (predict_fn, scorer, prompt registry) and calls `gepa.optimize()`.
+
+**Phase 3 — GEPA Iteration 0 (baseline):**
+
+```
+Iteration 0: Base program full valset score: -1.7459 over 183/183 examples
+```
+
+GEPA evaluates the seed prompt on ALL 183 items → **183 metric calls consumed**. Each `AFC is enabled` log line = one Gemini Flash predict call. The score is the average weighted score across all items (negative because FPs outweigh TPs under the guarded cost function).
+
+**Phase 4 — GEPA Iteration 1 (first proposal cycle):**
+
+Step 1 — **Candidate selection**:
+```
+Iteration 1: Selected program 0 score: -1.7459
+```
+Picks the only candidate from the Pareto frontier (the seed prompt).
+
+Step 2 — **Minibatch evaluation** (3 items, with trace capture):
+```
+AFC is enabled...  ← 3 concurrent predict calls on minibatch
+AFC is enabled...
+AFC is enabled...
+```
+3 metric calls consumed. GEPA captures full execution traces (model reasoning, scores) for these 3 items.
+
+Step 3 — **Reflection** (critic model):
+```
+LiteLLM completion() model=gemini-3.1-pro-preview; provider=vertex_ai
+Wrapper: Completed Call, calling success_handler   ← ~38 seconds
+```
+The reflection LM (Gemini 3.1 Pro with `thinking_level=HIGH`) receives the 3 traces and the current prompt. It analyzes failure patterns and proposes a new prompt. This is NOT a metric call — it's a separate LLM call to the critic model.
+
+Step 4 — **Proposal** (the new prompt text):
+```
+Iteration 1: Proposed new text for ...: ### Role & Persona
+You are an AI assistant specializing in product image comparison...
+```
+The full proposed prompt is logged. Notice it added category-specific directives (smartwatch crowns, strap matching, perspective differences) based on the 3 failure traces.
+
+Step 5 — **Minibatch validation** (same 3 items):
+```
+AFC is enabled...  ← 3 predict calls with new prompt
+AFC is enabled...
+AFC is enabled...
+```
+3 metric calls consumed. GEPA evaluates the proposal on the SAME 3 minibatch items.
+
+Step 6 — **Acceptance decision**:
+```
+Iteration 1: New subsample score 3.0 is better than old score -6.0.
+Continue to full eval and add to candidate pool.
+```
+Score improved from -6.0 to 3.0 on the minibatch → **ACCEPTED** → proceeds to full validation.
+
+Step 7 — **Full validation** (all 183 items):
+```
+AFC is enabled...   ← 183 concurrent predict calls
+AFC is enabled...
+... (many more)
+```
+183 metric calls consumed. The new prompt is evaluated on all 183 items.
+
+**Metric call budget after Iteration 1:**
+```
+Iteration 0:  183 calls (baseline)
+Iteration 1:    3 calls (minibatch eval)
+            +   3 calls (minibatch validation)
+            + 183 calls (full validation)
+            = 189 calls
+──────────────────────────────
+Total used: 372 / 2,928 budget
+Remaining:  2,556 calls
+```
+
+GEPA continues with Iteration 2, 3, ... until the 2,928 budget is exhausted. Most iterations will be **rejected** (proposal doesn't beat minibatch score → 6 calls wasted, no full validation). Accepted proposals trigger 183-call full validations, which dominate the budget.
+
+**Rough estimate**: With 2,928 budget and ~5-8 accepted proposals (each costing ~189 calls = 945-1,512 calls), the remaining ~1,400-2,000 calls support ~230-330 rejected proposal cycles (6 calls each). Total: **~240-340 GEPA iterations**, of which only **5-8 actually improve the prompt**.
+
+---
 
 ## Architecture
 
