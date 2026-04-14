@@ -119,8 +119,8 @@ Throughout optimization, GEPA maintains a **Pareto frontier** — multiple candi
 - Candidates are selected from the frontier for mutation using novelty-weighted sampling
 - A candidate that's best on 3 specific hard cases survives even if its overall score is mediocre
 - Different `frontier_type` settings control how the frontier is tracked:
-  - `instance`: Per-example Pareto dominance (candidate A survives if it's the best on even one example)
-  - `objective`: Per-objective (relevant for multi-objective optimization)
+  - **`instance` (default — what we use)**: Per-example Pareto dominance. A candidate survives if it's the best on even one training example. This means candidates that excel on specific hard cases are preserved even if their average score is mediocre. With our single-scorer setup, this keeps prompts that handle niche failure modes (e.g., "packaging-only images" or "extreme angles") alive in the pool for potential merging.
+  - `objective`: Per-objective (relevant for multi-objective optimization with multiple scorers)
   - `hybrid`/`cartesian`: Combinations of the above
 
 **After optimization** — final selection is simple:
