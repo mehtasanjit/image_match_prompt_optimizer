@@ -248,7 +248,7 @@ This runs 3 × 3 = 9 grid cells, each with full GEPA optimization + evaluation.
 
 ### Stepwise GEPA with Error-Focused Sampling
 
-Instead of random sub-sampling, this mode runs the current prompt on all training data between steps, classifies predictions as TP/FP/FN/TN, and enriches the next step's sample with error cases (hard example mining). Step 0 uses random sampling; steps 1+ focus on current failures.
+Instead of random sub-sampling, this mode runs the current prompt on **all** training data between steps (the entire `--data_dir` split), classifies predictions as TP/FP/FN/TN, and enriches the next step's sample with error cases (hard example mining). Step 0 uses `--subsample_fraction` for a random sample; steps 1+ classify all training items and resample based on the error fractions.
 
 ```bash
 ./venv/bin/python scripts/mlflow_gepa/run_gepa_binary_match_grid.py \
@@ -492,6 +492,10 @@ See [pipeline.md](pipeline.md) for the full multi-step pipeline documentation.
 | `--tp_fraction` | Fraction of true positives to include per step (error-focused mode) | `0.3` |
 | `--tn_fraction` | Fraction of true negatives to include per step (error-focused mode) | `0.3` |
 | `--eval_workers` | Concurrent workers for eval pipeline | `10` |
+| `--data_dir` | Training data directory (images + mapping CSV) | (required) |
+| `--eval_data_dir` | Validation data directory for post-optimization evaluation | (required) |
+| `--test_data_dir` | Test data directory for generalization check | (optional) |
+| `--full_data_dir` | Full dataset directory for final evaluation | (optional) |
 | `--num_iterations` | Comma-separated iteration counts for grid | (required) |
 | `--eval_cf_names` | Comma-separated Cloud Function names for grid | (required) |
 | `--reflection_prompt_template` | Custom reflection prompt for the critic model (see below) | (optional) |

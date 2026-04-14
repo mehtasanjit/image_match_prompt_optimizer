@@ -11,7 +11,6 @@ The objective is to compare a **user image** against a **reference image** and d
 ```
 data/
 ├── images/                          # Full labeled dataset
-│   ├── mapping_file.csv             # Master mapping across all categories
 │   ├── <category_a>/                # One folder per product category
 │   │   ├── <category_a>_mapping.csv # Category-specific mapping
 │   │   ├── reference_images/        # Reference images
@@ -61,10 +60,6 @@ abc123,footwear,abc123.jpg,abc123.jpg,Match
 def456,footwear,def456.jpg,def456.jpg,Mismatch
 ghi789,footwear,ghi789.jpg,ghi789.jpg,Inconclusive
 ```
-
-### Master Mapping
-
-`data/images/mapping_file.csv` contains all image pairs across all categories. Per-category mapping files contain only the rows for that category.
 
 ---
 
@@ -132,5 +127,4 @@ For the GEPA grid runners, each data split (train, eval, test, full) independent
 1. Create a subdirectory under `data/images/` with the category name
 2. Place reference images in `reference_images/` and user images in `images/`
 3. Create a `{category}_mapping.csv` with the columns above
-4. Add rows to the master `data/images/mapping_file.csv`
-5. Run sampling to create train/validation/test splits
+4. Run sampling to create train/validation/test splits

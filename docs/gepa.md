@@ -74,8 +74,10 @@ The blend step uses a template from `prompts/blend_prompts_template.txt` (match)
 A variant of chaining that uses **hard example mining between steps**. Instead of random sub-sampling, it runs the current prompt on all training data after each step, classifies predictions as TP/FP/FN/TN, and enriches the next step's training sample with error cases.
 
 **Flow per step:**
-1. **Step 0**: Random sub-sample (no prior predictions exist)
-2. **Steps 1+**: Run predict_fn on full training data → classify each item as TP/FP/FN/TN → subsample with configurable quadrant fractions
+1. **Step 0**: Random sub-sample using `--subsample_fraction` (no prior predictions exist)
+2. **Steps 1+**: Run predict_fn on **all** training data in `--data_dir` → classify each item as TP/FP/FN/TN → subsample with configurable quadrant fractions
+
+**Important**: In error-focused mode, the inter-step classification always runs on the **entire** training split (not the subsampled portion). This ensures the optimizer discovers errors on items it hasn't seen yet. The `--subsample_fraction` only controls the step 0 random sample size.
 
 Default fractions: 100% of FP, 100% of FN, 30% of TP, 30% of TN — focusing GEPA on the current failure modes.
 
@@ -129,7 +131,8 @@ Runs GEPA across a Cartesian product of Cloud Function names × iteration counts
 
 The grid runner:
 - Supports all three modes (basic, stepwise chaining, stepwise blend) via `--step_size` and `--no_chaining` flags
-- Evaluates each optimized prompt on train, validation, and optional test splits
+- **`--data_dir`** and **`--eval_data_dir`** are required; **`--test_data_dir`** and **`--full_data_dir`** are optional
+- Evaluates each optimized prompt on train, validation, and optional test/full splits
 - Tracks best cells by match/mismatch precision, F1, and GEPA score
 - Writes incremental results after each grid cell
 

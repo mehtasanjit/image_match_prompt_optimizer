@@ -338,18 +338,25 @@ def run_stepwise(
     predict.init(config)
     scorer.init(config.eval_cf_url, score_key=config.eval_score_key)
 
-    # 2. Load full training data
+    # 2. Load training data
+    # When error_focused, load ALL training data so error classification sees
+    # every item. The subsample_fraction only controls step 0's random sample.
+    # Without error_focused, max_train_samples pre-limits the pool.
+    load_limit = 0 if error_focused else config.max_train_samples
     full_train_data = data_loader.load_eval_data(
         category=config.category,
         data_dir=config.data_dir,
         mapping_csv=config.mapping_csv,
-        limit=config.max_train_samples,
+        limit=load_limit,
         random_seed=config.random_seed,
     )
     full_size = len(full_train_data)
     subsample_size = max(1, int(full_size * subsample_fraction))
     logger.info("Full training data: %d rows, sub-sample size: %d per step",
                 full_size, subsample_size)
+    if error_focused:
+        logger.info("Error-focused mode: error classification will run on all %d items; "
+                     "step 0 random sample = %d items", full_size, subsample_size)
 
     # 3. Load initial prompt
     with open(config.initial_prompt_path, "r") as f:
