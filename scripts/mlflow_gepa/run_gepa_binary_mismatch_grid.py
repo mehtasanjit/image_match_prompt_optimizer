@@ -425,6 +425,7 @@ def main():
                     tp_fraction=args.tp_fraction,
                     tn_fraction=args.tn_fraction,
                     error_eval_workers=args.eval_workers,
+                    positive_class="mismatch",
                 )
             else:
                 result, final_prompt_text = run_gepa(gepa_config)

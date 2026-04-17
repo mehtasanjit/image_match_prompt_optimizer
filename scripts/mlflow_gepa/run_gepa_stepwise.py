@@ -134,13 +134,17 @@ def _extract_label(model_output: str) -> str:
     return cleaned.strip().lower()
 
 
-def _classify_prediction(predicted_label: str, ground_truth: str) -> str:
-    """Classify a prediction as TP/FP/FN/TN for binary Match classification.
+def _classify_prediction(predicted_label: str, ground_truth: str, positive_class: str = "match") -> str:
+    """Classify a prediction as TP/FP/FN/TN for binary classification.
 
-    Match = positive class. Everything else (Not_Match, Mismatch, Inconclusive) = negative.
+    Args:
+        predicted_label: Extracted label from model output (lowercase).
+        ground_truth: Ground truth label from the dataset.
+        positive_class: The positive class label (lowercase). Default "match".
+                        For mismatch optimization, pass "mismatch".
     """
-    pred_positive = predicted_label in ("match",)
-    gt_positive = ground_truth.lower() in ("match",)
+    pred_positive = predicted_label == positive_class
+    gt_positive = ground_truth.lower() == positive_class
 
     if pred_positive and gt_positive:
         return "TP"
@@ -157,8 +161,13 @@ def _run_predictions_on_data(
     current_prompt_text: str,
     config: GEPAConfig,
     max_workers: int = 10,
+    positive_class: str = "match",
 ) -> pd.DataFrame:
     """Run predict_fn on all training data and classify each as TP/FP/FN/TN.
+
+    Args:
+        positive_class: The positive class for TP/FP/FN/TN classification.
+                        "match" for match optimization, "mismatch" for mismatch optimization.
 
     Returns the full_train_data DataFrame with added columns:
     - predicted_output: raw model JSON string
@@ -206,6 +215,7 @@ def _run_predictions_on_data(
         lambda row: _classify_prediction(
             row["predicted_label"],
             row["outputs"]["ground_truth"],
+            positive_class=positive_class,
         ),
         axis=1,
     )
@@ -278,6 +288,7 @@ def run_stepwise(
     tp_fraction: float = 0.3,
     tn_fraction: float = 0.3,
     error_eval_workers: int = 10,
+    positive_class: str = "match",
 ) -> tuple:
     """
     Execute stepwise GEPA optimization with per-step sub-sampling.
@@ -297,6 +308,8 @@ def run_stepwise(
         tp_fraction: Fraction of true positives to include (0.0-1.0).
         tn_fraction: Fraction of true negatives to include (0.0-1.0).
         error_eval_workers: Concurrent workers for inter-step prediction evaluation.
+        positive_class: The positive class for TP/FP/FN/TN classification.
+                        "match" for match optimization, "mismatch" for mismatch optimization.
 
     Returns:
         Tuple of (final_result, final_prompt_text).
@@ -410,6 +423,7 @@ def run_stepwise(
             classified = _run_predictions_on_data(
                 full_train_data, current_prompt_text, config,
                 max_workers=error_eval_workers,
+                positive_class=positive_class,
             )
             step_train_data = _error_aware_subsample(
                 classified,
